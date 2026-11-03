@@ -3,7 +3,6 @@ name: NEXTBYTE News Automation
 
 on:
   workflow_dispatch:
-
   schedule:
     - cron: "*/10 * * * *"
 
