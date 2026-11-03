@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: nextbyte-news
+  cancel-in-progress: false
+
 jobs:
   collect-news:
     runs-on: ubuntu-latest
@@ -34,4 +38,5 @@ jobs:
           git config user.email "nextbyte-bot@users.noreply.github.com"
           git add seen.json
           git diff --cached --quiet || git commit -m "Update seen news"
-          git push
+          git pull --rebase origin main
+          git push origin HEAD:main
