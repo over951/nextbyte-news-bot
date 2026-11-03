@@ -1,11 +1,10 @@
-```yaml
+
 name: NEXTBYTE News Automation
 
 on:
   workflow_dispatch:
-
   schedule:
-    - cron: "7,17,27,37,47,57 * * * *"
+    - cron: '7,17,27,37,47,57 * * * *'
 
 permissions:
   contents: write
@@ -28,7 +27,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
 
       - name: Install dependencies
         run: |
@@ -46,11 +45,9 @@ jobs:
           git config user.name "NEXTBYTE Bot"
           git config user.email "nextbyte-bot@users.noreply.github.com"
           git add seen.json
-
           if ! git diff --cached --quiet; then
             git commit -m "Update seen news"
           fi
-
           git fetch origin main
           git rebase origin/main
           git push origin HEAD:main
@@ -64,5 +61,4 @@ jobs:
           curl -sS -X POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=⚠️ NEXTBYTE BOT ERROR: The latest automation run failed. Check GitHub Actions logs."
-```
+            --data-urlencode "text=NEXTBYTE BOT ERROR: Automation failed. Check GitHub Actions logs."
