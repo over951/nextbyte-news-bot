@@ -3,6 +3,7 @@ import os
 import re
 import json
 import html
+import uuid
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -12,7 +13,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse, urljoin
 
 # ==========================================
-# NEXTBYTE CONFIGURATION
+# NEXTBYTE SETTINGS
 # ==========================================
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -28,31 +29,70 @@ FEEDS = [
 SEEN_FILE = Path("seen.json")
 MAX_STORIES = 10
 MAX_DESCRIPTION = 150
+MAX_IMAGE_SIZE = 8 * 1024 * 1024
 
 
 # ==========================================
-# HTML IMAGE PARSER
+# HTML PARSERS
 # ==========================================
 
-class ImageParser(HTMLParser):
+class FeedHTMLParser(HTMLParser):
     def __init__(self):
         super().__init__()
         self.images = []
+        self.links = []
 
     def handle_starttag(self, tag, attrs):
-        if tag.lower() != "img":
-            return
-
         attrs = dict(attrs)
-        src = attrs.get("src") or attrs.get("data-src")
 
-        if src:
-            self.images.append(src)
+        if tag.lower() == "img":
+            src = attrs.get("src") or attrs.get("data-src")
+            if src:
+                self.images.append(src)
+
+        if tag.lower() == "a":
+            href = attrs.get("href")
+            if href:
+                self.links.append(href)
+
+
+class ArticleMetaParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.image = None
+        self.canonical = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        tag = tag.lower()
+
+        if tag == "meta":
+            key = (
+                attrs.get("property")
+                or attrs.get("name")
+                or ""
+            ).lower()
+
+            if key in ("og:image", "twitter:image", "twitter:image:src"):
+                value = attrs.get("content", "").strip()
+
+                if value and not self.image:
+                    self.image = value
+
+        if tag == "link":
+            rel = attrs.get("rel", "").lower().split()
+
+            if "canonical" in rel:
+                self.canonical = attrs.get("href")
 
 
 # ==========================================
-# CLEAN TEXT
+# GENERAL HELPERS
 # ==========================================
+
+def local_name(tag):
+    return tag.split("}")[-1].lower()
+
 
 def clean_text(value):
     value = re.sub(r"<[^>]+>", " ", value or "")
@@ -60,37 +100,27 @@ def clean_text(value):
     return re.sub(r"\s+", " ", value).strip()
 
 
-def local_name(tag):
-    return tag.split("}")[-1].lower()
-
-
-# ==========================================
-# ARTICLE LINK VALIDATION
-# ==========================================
-
-def valid_article_url(value):
+def valid_url(value):
     if not value:
         return False
 
-    value = html.unescape(value.strip())
-
     try:
-        parsed = urlparse(value)
+        parsed = urlparse(value.strip())
+        host = (parsed.hostname or "").lower()
 
         if parsed.scheme not in ("http", "https"):
             return False
 
-        host = (parsed.hostname or "").lower()
-
         if not host or "." not in host:
             return False
 
-        # Reject images, emoji files and other media.
-        if host in (
+        blocked_hosts = (
             "abs.twimg.com",
             "pbs.twimg.com",
             "twemoji.maxcdn.com",
-        ):
+        )
+
+        if any(host == h or host.endswith("." + h) for h in blocked_hosts):
             return False
 
         if re.search(
@@ -107,68 +137,73 @@ def valid_article_url(value):
 
 
 # ==========================================
-# GET ARTICLE TITLE AND DESCRIPTION
+# EXTRACT ARTICLE LINK
 # ==========================================
 
-def get_field(item, names):
-    for element in item:
-        if local_name(element.tag) in names:
-            if element.text:
-                return element.text.strip()
-
-    return ""
-
-
-# ==========================================
-# GET REAL ARTICLE LINK
-# ==========================================
-
-def get_link(item, feed_url):
+def get_article_link(item, feed_url):
     candidates = []
 
-    # Atom feeds: prefer alternate HTML links.
     for element in item:
-        if local_name(element.tag) == "link":
+        name = local_name(element.tag)
+
+        if name == "link":
             href = element.attrib.get("href", "").strip()
             rel = element.attrib.get("rel", "alternate").lower()
             media_type = element.attrib.get("type", "").lower()
 
             if href and rel == "alternate":
-                if media_type in (
-                    "",
-                    "text/html",
-                    "application/xhtml+xml"
-                ):
+                if media_type in ("", "text/html", "application/xhtml+xml"):
                     candidates.append(href)
 
-    # RSS feeds: collect text links and GUIDs.
-    for element in item:
-        name = local_name(element.tag)
+            text_value = (element.text or "").strip()
+            if text_value:
+                candidates.append(text_value)
 
-        if name in ("link", "guid", "id"):
+        elif name == "guid":
             value = (element.text or "").strip()
+            is_permalink = element.attrib.get(
+                "isPermaLink", "true"
+            ).lower()
 
-            if name == "guid" and element.attrib.get("isPermaLink", "true").lower() == "false":
-                continue
+            if value and is_permalink != "false":
+                candidates.append(value)
 
+        elif name == "id":
+            value = (element.text or "").strip()
             if value:
                 candidates.append(value)
 
-    for candidate in candidates:
-        candidate = urljoin(feed_url, candidate)
+    # Links embedded in the feed description are a last resort.
+    description = ""
 
-        if valid_article_url(candidate):
+    for element in item:
+        if local_name(element.tag) in (
+            "description", "summary", "encoded", "content"
+        ):
+            description += element.text or ""
+
+    parser = FeedHTMLParser()
+
+    try:
+        parser.feed(description)
+        candidates.extend(parser.links)
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        candidate = urljoin(feed_url, html.unescape(candidate.strip()))
+
+        if valid_url(candidate):
             return candidate
 
     return None
 
 
 # ==========================================
-# GET PUBLISHER IMAGE
+# EXTRACT RSS IMAGE
 # ==========================================
 
-def find_image(item, description, feed_url):
-    # Look for RSS media images.
+def get_feed_image(item, description, feed_url):
     for element in item.iter():
         name = local_name(element.tag)
 
@@ -194,11 +229,10 @@ def find_image(item, description, feed_url):
 
             image_url = urljoin(feed_url, image_url)
 
-            if image_url.startswith(("https://", "http://")):
+            if image_url.startswith(("http://", "https://")):
                 return image_url
 
-    # Look for images inside HTML descriptions.
-    parser = ImageParser()
+    parser = FeedHTMLParser()
 
     try:
         parser.feed(description or "")
@@ -208,10 +242,85 @@ def find_image(item, description, feed_url):
     for image_url in parser.images:
         image_url = urljoin(feed_url, image_url)
 
-        if image_url.startswith(("https://", "http://")):
+        if image_url.startswith(("http://", "https://")):
             return image_url
 
     return None
+
+
+# ==========================================
+# ARTICLE PAGE IMAGE FALLBACK
+# ==========================================
+
+def get_article_image(article_url):
+    try:
+        request = urllib.request.Request(
+            article_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; NEXTBYTE/2.0)",
+                "Accept": "text/html"
+            }
+        )
+
+        with urllib.request.urlopen(request, timeout=20) as response:
+            page = response.read(1_500_000).decode(
+                "utf-8", errors="replace"
+            )
+            final_url = response.geturl()
+
+        parser = ArticleMetaParser()
+        parser.feed(page)
+
+        if parser.image:
+            image_url = urljoin(final_url, parser.image)
+
+            if image_url.startswith(("http://", "https://")):
+                return image_url
+
+    except Exception as error:
+        print(f"Article image lookup failed: {error}")
+
+    return None
+
+
+# ==========================================
+# DOWNLOAD IMAGE
+# ==========================================
+
+def download_image(image_url):
+    if not image_url:
+        return None
+
+    try:
+        request = urllib.request.Request(
+            image_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; NEXTBYTE/2.0)",
+                "Accept": "image/avif,image/webp,image/png,image/jpeg,*/*"
+            }
+        )
+
+        with urllib.request.urlopen(request, timeout=25) as response:
+            content_type = response.headers.get("Content-Type", "").lower()
+
+            if not content_type.startswith("image/"):
+                print(f"Not an image: {content_type}")
+                return None
+
+            image_data = response.read(MAX_IMAGE_SIZE + 1)
+
+            if len(image_data) > MAX_IMAGE_SIZE:
+                print("Image too large.")
+                return None
+
+            if not image_data:
+                return None
+
+            return image_data
+
+    except Exception as error:
+        print(f"Image download failed: {error}")
+        return None
 
 
 # ==========================================
@@ -221,9 +330,7 @@ def find_image(item, description, feed_url):
 def fetch_feed(feed_url):
     request = urllib.request.Request(
         feed_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 NEXTBYTE-NewsBot/2.0"
-        }
+        headers={"User-Agent": "Mozilla/5.0 NEXTBYTE/2.0"}
     )
 
     with urllib.request.urlopen(request, timeout=30) as response:
@@ -235,24 +342,36 @@ def fetch_feed(feed_url):
         if local_name(item.tag) not in ("item", "entry"):
             continue
 
-        title = get_field(item, ["title"])
+        title = ""
+        description = ""
 
-        description = get_field(
-            item,
-            ["description", "summary", "encoded", "content"]
-        )
+        for element in item:
+            name = local_name(element.tag)
 
-        link = get_link(item, feed_url)
+            if name == "title" and not title:
+                title = element.text or ""
+
+            if name in ("description", "summary", "encoded", "content"):
+                if element.text:
+                    description = element.text
+                    break
+
+        title = clean_text(title)
+        description = clean_text(description)
+
+        link = get_article_link(item, feed_url)
 
         if not title or not link:
-            print(f"Skipped item with invalid article link: {title}")
+            print(f"Skipped invalid story: {title}")
             continue
 
+        image = get_feed_image(item, description, feed_url)
+
         stories.append({
-            "title": clean_text(title),
+            "title": title,
             "link": link,
-            "description": clean_text(description),
-            "image": find_image(item, description, feed_url)
+            "description": description,
+            "image": image
         })
 
     return stories
@@ -263,10 +382,7 @@ def fetch_feed(feed_url):
 # ==========================================
 
 def telegram_request(method, fields):
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/{method}"
-    )
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
 
     data = urllib.parse.urlencode(fields).encode()
 
@@ -281,15 +397,57 @@ def telegram_request(method, fields):
     return result
 
 
+def telegram_send_photo(image_data, caption):
+    boundary = uuid.uuid4().hex
+    body = bytearray()
+
+    def add_field(name, value):
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        )
+        body.extend(str(value).encode())
+        body.extend(b"\r\n")
+
+    add_field("chat_id", CHAT_ID)
+    add_field("caption", caption)
+    add_field("parse_mode", "HTML")
+
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(
+        b'Content-Disposition: form-data; name="photo"; filename="news.jpg"\r\n'
+    )
+    body.extend(b"Content-Type: application/octet-stream\r\n\r\n")
+    body.extend(image_data)
+    body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode())
+
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+        data=bytes(body),
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}"
+        }
+    )
+
+    with urllib.request.urlopen(request, timeout=60) as response:
+        result = json.loads(response.read())
+
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram photo error: {result}")
+
+    return result
+
+
 # ==========================================
-# SHORT PROFESSIONAL CAPTION
+# SHORT CLICKABLE POST
 # ==========================================
 
-def make_caption(story):
+def make_caption(story, with_image=True):
     title = html.escape(story["title"])
-
-    description = story["description"][:MAX_DESCRIPTION]
-    description = html.escape(description)
+    description = html.escape(
+        story["description"][:MAX_DESCRIPTION]
+    )
 
     link = html.escape(story["link"], quote=True)
 
@@ -301,11 +459,10 @@ def make_caption(story):
         "#AI #Technology"
     )
 
-    # Telegram photo captions: maximum 1024 characters.
-    if len(caption) > 1000:
-        description = html.escape(
-            story["description"][:50]
-        )
+    limit = 1000 if with_image else 3900
+
+    if len(caption) > limit:
+        description = html.escape(story["description"][:50])
 
         caption = (
             "⚡ <b>NEXTBYTE</b>\n\n"
@@ -315,7 +472,7 @@ def make_caption(story):
             "#AI #Technology"
         )
 
-    return caption[:1024]
+    return caption
 
 
 # ==========================================
@@ -323,24 +480,30 @@ def make_caption(story):
 # ==========================================
 
 def send_story(story):
-    caption = make_caption(story)
-
+    # Try the feed image first, then the article's OG image.
     image_url = story.get("image")
 
-    if image_url:
-        try:
-            telegram_request("sendPhoto", {
-                "chat_id": CHAT_ID,
-                "photo": image_url,
-                "caption": caption,
-                "parse_mode": "HTML"
-            })
+    image_data = download_image(image_url) if image_url else None
 
-            print(f"Published image: {story['title']}")
+    if not image_data:
+        fallback_url = get_article_image(story["link"])
+
+        if fallback_url:
+            image_data = download_image(fallback_url)
+
+    if image_data:
+        try:
+            caption = make_caption(story, with_image=True)
+            telegram_send_photo(image_data, caption)
+
+            print(f"Published with image: {story['title']}")
             return True
 
         except Exception as error:
-            print(f"Image failed; trying text: {error}")
+            print(f"Photo publishing failed: {error}")
+
+    # Text fallback still has a clickable article link.
+    caption = make_caption(story, with_image=False)
 
     telegram_request("sendMessage", {
         "chat_id": CHAT_ID,
@@ -349,12 +512,12 @@ def send_story(story):
         "disable_web_page_preview": "true"
     })
 
-    print(f"Published text: {story['title']}")
+    print(f"Published text only: {story['title']}")
     return True
 
 
 # ==========================================
-# MAIN AUTOMATION
+# MAIN
 # ==========================================
 
 def main():
@@ -374,11 +537,11 @@ def main():
         try:
             stories = fetch_feed(feed)
 
+            print(f"Feed checked: {feed} ({len(stories)} stories)")
+
             for story in stories:
                 if story["link"] not in seen:
                     new_stories[story["link"]] = story
-
-            print(f"Feed checked: {feed}")
 
         except Exception as error:
             print(f"Feed error: {feed} — {error}")
@@ -397,14 +560,14 @@ def main():
                 seen.add(story["link"])
 
         except Exception as error:
-            print(f"Publishing failed: {error}")
+            print(f"Publishing failed: {story['title']} — {error}")
 
     SEEN_FILE.write_text(
         json.dumps(sorted(seen), indent=2),
         encoding="utf-8"
     )
 
-    print("NEXTBYTE automation finished.")
+    print("NEXTBYTE finished.")
 
 
 if __name__ == "__main__":
