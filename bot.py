@@ -1,10 +1,13 @@
 
 import os
 import json
+import re
+import html
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from html.parser import HTMLParser
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -20,17 +23,64 @@ SEEN_FILE = Path("seen.json")
 MAX_STORIES = 5
 
 
-def load_seen():
-    if SEEN_FILE.exists():
-        return set(json.loads(SEEN_FILE.read_text()))
-    return set()
+class ImageParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.images = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "img":
+            attrs = dict(attrs)
+            src = attrs.get("src") or attrs.get("data-src")
+            if src:
+                self.images.append(src)
 
 
-def get_text(element, names):
-    for name in names:
-        found = element.find(name)
-        if found is not None and found.text:
-            return found.text.strip()
+def clean_text(value):
+    value = re.sub(r"<[^>]+>", " ", value or "")
+    value = html.unescape(value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def local_name(tag):
+    return tag.split("}")[-1].lower()
+
+
+def find_image(item, description):
+    # Look for RSS media:content, media:thumbnail and enclosure images
+    for element in item.iter():
+        name = local_name(element.tag)
+
+        if name in ("content", "thumbnail", "enclosure"):
+            url = element.attrib.get("url") or element.attrib.get("href")
+            media_type = element.attrib.get("type", "")
+
+            if url and (
+                name != "enclosure"
+                or media_type.startswith("image/")
+                or re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", url, re.I)
+            ):
+                return url
+
+    # Look for an image embedded in the article description
+    parser = ImageParser()
+    try:
+        parser.feed(description or "")
+    except Exception:
+        pass
+
+    if parser.images:
+        return parser.images[0]
+
+    return None
+
+
+def get_field(item, names):
+    for element in item:
+        if local_name(element.tag) in names:
+            if element.text:
+                return element.text.strip()
+
     return ""
 
 
@@ -40,89 +90,121 @@ def fetch_feed(url):
         headers={"User-Agent": "NEXTBYTE-NewsBot/1.0"}
     )
 
-    with urllib.request.urlopen(request, timeout=20) as response:
+    with urllib.request.urlopen(request, timeout=25) as response:
         root = ET.fromstring(response.read())
 
     stories = []
 
     for item in root.iter():
-        if item.tag.split("}")[-1] not in ("item", "entry"):
+        if local_name(item.tag) not in ("item", "entry"):
             continue
 
-        title = get_text(item, ["title"])
-        link = get_text(item, ["link", "guid"])
-        description = get_text(
-            item, ["description", "summary", "content"]
+        title = get_field(item, ["title"])
+        link = get_field(item, ["link", "guid"])
+        description = get_field(
+            item, ["description", "summary", "encoded", "content"]
         )
 
         if not link:
-            link_element = item.find("link")
-            if link_element is not None:
-                link = link_element.attrib.get("href", "")
+            for element in item:
+                if local_name(element.tag) == "link":
+                    link = element.attrib.get("href", "")
+                    if link:
+                        break
 
         if title and link:
             stories.append({
-                "title": title,
+                "title": clean_text(title),
                 "link": link,
-                "description": description
+                "description": clean_text(description),
+                "image": find_image(item, description)
             })
 
     return stories
 
 
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": "true"
-    }).encode()
+def telegram_request(method, fields):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    data = urllib.parse.urlencode(fields).encode()
 
     request = urllib.request.Request(url, data=data)
 
-    with urllib.request.urlopen(request, timeout=20) as response:
+    with urllib.request.urlopen(request, timeout=40) as response:
         result = json.loads(response.read())
 
     if not result.get("ok"):
-        raise RuntimeError("Telegram did not accept the message")
+        raise RuntimeError(f"Telegram API error: {result}")
+
+    return result
+
+
+def send_story(story):
+    title = story["title"]
+    description = story["description"][:450]
+    link = story["link"]
+
+    caption = (
+        f"⚡ NEXTBYTE | TECHNOLOGY BRIEFING\n\n"
+        f"{title}\n\n"
+        f"{description}\n\n"
+        f"READ THE ORIGINAL REPORT:\n{link}\n\n"
+        f"#AI #Technology"
+    )
+
+    # Telegram photo captions have a 1024-character limit
+    caption = caption[:1000]
+
+    image_url = story.get("image")
+
+    if image_url:
+        try:
+            telegram_request("sendPhoto", {
+                "chat_id": CHAT_ID,
+                "photo": image_url,
+                "caption": caption
+            })
+            print(f"Sent image: {title}")
+            return
+        except Exception as error:
+            print(f"Image unavailable, sending text instead: {error}")
+
+    telegram_request("sendMessage", {
+        "chat_id": CHAT_ID,
+        "text": caption,
+        "disable_web_page_preview": "false"
+    })
+
+    print(f"Sent text: {title}")
 
 
 def main():
-    seen = load_seen()
-    new_stories = []
+    seen = set()
+
+    if SEEN_FILE.exists():
+        seen = set(json.loads(SEEN_FILE.read_text()))
+
+    new_stories = {}
 
     for feed in FEEDS:
         try:
             for story in fetch_feed(feed):
                 if story["link"] not in seen:
-                    new_stories.append(story)
+                    new_stories[story["link"]] = story
         except Exception as error:
             print(f"Feed error: {feed} — {error}")
 
-    # Remove duplicate links
-    unique = {}
-    for story in new_stories:
-        unique[story["link"]] = story
-
-    stories = list(unique.values())[:MAX_STORIES]
+    stories = list(new_stories.values())[:MAX_STORIES]
 
     if not stories:
         print("No new stories found.")
         return
 
     for story in stories:
-        description = story["description"][:350].strip()
-        message = (
-            f"⚡ NEXTBYTE NEWS\n\n"
-            f"{story['title']}\n\n"
-            f"{description}\n\n"
-            f"Source: {story['link']}\n\n"
-            f"#AI #Technology"
-        )
-
-        send_telegram(message)
-        seen.add(story["link"])
-        print(f"Sent: {story['title']}")
+        try:
+            send_story(story)
+            seen.add(story["link"])
+        except Exception as error:
+            print(f"Could not send story: {error}")
 
     SEEN_FILE.write_text(json.dumps(sorted(seen), indent=2))
 
