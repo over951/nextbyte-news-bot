@@ -11,9 +11,9 @@ from pathlib import Path
 from html.parser import HTMLParser
 from urllib.parse import urlparse
 
-# ==================================================
-# NEXTBYTE CONFIGURATION
-# ==================================================
+# ==========================================
+# NEXTBYTE SETTINGS
+# ==========================================
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -28,10 +28,9 @@ FEEDS = [
 SEEN_FILE = Path("seen.json")
 MAX_STORIES = 10
 
-
-# ==================================================
+# ==========================================
 # IMAGE EXTRACTION
-# ==================================================
+# ==========================================
 
 class ImageParser(HTMLParser):
     def __init__(self):
@@ -45,20 +44,17 @@ class ImageParser(HTMLParser):
             if image:
                 self.images.append(image)
 
-
-# ==================================================
+# ==========================================
 # TEXT HELPERS
-# ==================================================
+# ==========================================
 
 def clean_text(value):
     value = re.sub(r"<[^>]+>", " ", value or "")
     value = html.unescape(value)
     return re.sub(r"\s+", " ", value).strip()
 
-
 def local_name(tag):
     return tag.split("}")[-1].lower()
-
 
 def get_field(item, names):
     for element in item:
@@ -66,7 +62,6 @@ def get_field(item, names):
             if element.text:
                 return element.text.strip()
     return ""
-
 
 def get_link(item):
     for element in item:
@@ -79,7 +74,6 @@ def get_link(item):
                 return element.text.strip()
 
     return get_field(item, ["guid", "id"])
-
 
 def find_image(item, description):
     for element in item.iter():
@@ -116,17 +110,14 @@ def find_image(item, description):
 
     return None
 
-
-# ==================================================
-# RSS FEED READER
-# ==================================================
+# ==========================================
+# RSS NEWS READER
+# ==========================================
 
 def fetch_feed(feed_url):
     request = urllib.request.Request(
         feed_url,
-        headers={
-            "User-Agent": "NEXTBYTE-NewsBot/1.0"
-        }
+        headers={"User-Agent": "NEXTBYTE-NewsBot/1.0"}
     )
 
     with urllib.request.urlopen(request, timeout=30) as response:
@@ -161,10 +152,9 @@ def fetch_feed(feed_url):
 
     return stories
 
-
-# ==================================================
+# ==========================================
 # TELEGRAM API
-# ==================================================
+# ==========================================
 
 def telegram_request(method, fields):
     url = (
@@ -174,56 +164,55 @@ def telegram_request(method, fields):
 
     data = urllib.parse.urlencode(fields).encode()
 
-    request = urllib.request.Request(
-        url,
-        data=data
-    )
+    request = urllib.request.Request(url, data=data)
 
     with urllib.request.urlopen(request, timeout=45) as response:
         result = json.loads(response.read())
 
     if not result.get("ok"):
-        raise RuntimeError(
-            f"Telegram API error: {result}"
-        )
+        raise RuntimeError(f"Telegram error: {result}")
 
     return result
 
+# ==========================================
+# SHORT PROFESSIONAL NEXTBYTE POSTS
+# ==========================================
 
-# ==================================================
-# PROFESSIONAL NEXTBYTE POST
-# ==================================================
-
-def make_caption(story, description_limit=350):
+def make_caption(story):
     title = html.escape(story["title"])
 
-    description = story["description"][:description_limit]
+    description = story["description"][:160]
     description = html.escape(description)
 
-    link = story["link"]
-    safe_link = html.escape(link, quote=True)
-
-    domain = urlparse(link).netloc.replace("www.", "")
-    safe_domain = html.escape(domain)
+    link = html.escape(story["link"], quote=True)
 
     caption = (
-        "⚡ <b>NEXTBYTE</b>\n"
-        "<i>TECHNOLOGY INTELLIGENCE</i>\n\n"
-        "🔵 <b>LATEST REPORT</b>\n\n"
+        "⚡ <b>NEXTBYTE</b>\n\n"
         f"<b>{title}</b>\n\n"
         f"{description}\n\n"
-        f'🔗 <a href="{safe_link}">READ THE FULL STORY</a>\n'
-        f"<i>Source: {safe_domain}</i>\n\n"
-        "<b>THE FUTURE, BEFORE EVERYONE.</b>\n"
-        "#AI #Technology #NEXTBYTE"
+        f'<a href="{link}">READ FULL STORY ↗</a>\n\n'
+        "#AI #Technology"
     )
 
-    # Telegram photo captions have a 1024-character limit.
+    # Keep photo captions within Telegram limits.
     if len(caption) > 1000:
-        return make_caption(story, max(50, description_limit - 50))
+        description = html.escape(
+            story["description"][:70]
+        )
 
-    return caption
+        caption = (
+            "⚡ <b>NEXTBYTE</b>\n\n"
+            f"<b>{title}</b>\n\n"
+            f"{description}\n\n"
+            f'<a href="{link}">READ FULL STORY ↗</a>\n\n'
+            "#AI #Technology"
+        )
 
+    return caption[:1024]
+
+# ==========================================
+# PUBLISH NEWS
+# ==========================================
 
 def send_story(story):
     caption = make_caption(story)
@@ -243,7 +232,7 @@ def send_story(story):
             return True
 
         except Exception as error:
-            print(f"Image failed; using text: {error}")
+            print(f"Image failed, sending text: {error}")
 
     telegram_request("sendMessage", {
         "chat_id": CHAT_ID,
@@ -255,10 +244,9 @@ def send_story(story):
     print(f"Published text: {story['title']}")
     return True
 
-
-# ==================================================
+# ==========================================
 # MAIN AUTOMATION
-# ==================================================
+# ==========================================
 
 def main():
     if SEEN_FILE.exists():
@@ -273,13 +261,11 @@ def main():
 
     for feed in FEEDS:
         try:
-            stories = fetch_feed(feed)
-
-            for story in stories:
+            for story in fetch_feed(feed):
                 if story["link"] not in seen:
                     new_stories[story["link"]] = story
 
-            print(f"Checked feed: {feed}")
+            print(f"Checked: {feed}")
 
         except Exception as error:
             print(f"Feed error: {feed} — {error}")
@@ -287,7 +273,7 @@ def main():
     stories = list(new_stories.values())[:MAX_STORIES]
 
     if not stories:
-        print("No new stories found.")
+        print("No new stories.")
         return
 
     print(f"Found {len(stories)} new stories.")
@@ -298,18 +284,14 @@ def main():
                 seen.add(story["link"])
 
         except Exception as error:
-            print(
-                f"Could not publish "
-                f"{story['title']}: {error}"
-            )
+            print(f"Publishing error: {error}")
 
     SEEN_FILE.write_text(
         json.dumps(sorted(seen), indent=2),
         encoding="utf-8"
     )
 
-    print("NEXTBYTE automation completed.")
-
+    print("NEXTBYTE finished successfully.")
 
 if __name__ == "__main__":
     main()
