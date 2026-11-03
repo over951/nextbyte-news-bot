@@ -1,3 +1,4 @@
+
 import os
 import re
 import html
@@ -5,13 +6,16 @@ import json
 import time
 import hashlib
 import logging
+from collections import defaultdict, deque
 from urllib.parse import urlparse, urljoin
 
 import requests
 import feedparser
 from bs4 import BeautifulSoup
 
-# ---------------- SETTINGS ----------------
+# ==========================================
+# NEXTBYTE NEWS BOT
+# ==========================================
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -20,26 +24,77 @@ SEEN_FILE = "seen.json"
 MAX_STORIES = 10
 REQUEST_TIMEOUT = 20
 MAX_IMAGE_SIZE = 8 * 1024 * 1024
-X_CHARACTER_LIMIT = 280
-
-FEEDS = [
-    "https://openai.com/news/rss.xml",
-    "https://www.technologyreview.com/topic/artificial-intelligence/feed/",
-    "https://blog.research.google/feeds/posts/default?alt=rss",
-    "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
-]
+X_LIMIT = 280
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; NEXTBYTE-NewsBot/1.0)"
 }
+
+# ==========================================
+# NEWS SOURCES
+# ==========================================
+
+FEEDS = [
+    # AI companies and research
+    "https://openai.com/news/rss.xml",
+    "https://deepmind.google/blog/rss.xml",
+    "https://huggingface.co/blog/feed.xml",
+    "https://blog.google/technology/ai/rss/",
+
+    # Independent AI journalism
+    "https://techcrunch.com/category/artificial-intelligence/feed/",
+    "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+    "https://arstechnica.com/ai/feed/",
+    "https://www.wired.com/feed/tag/ai/latest/rss",
+    "https://www.technologyreview.com/topic/artificial-intelligence/feed/",
+    "https://the-decoder.com/feed/",
+
+    # General technology news
+    "https://feeds.arstechnica.com/arstechnica/index",
+    "https://techcrunch.com/feed/",
+    "https://www.theverge.com/rss/index.xml",
+    "https://www.wired.com/feed/rss",
+    "https://www.engadget.com/rss.xml",
+]
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s"
 )
 
+# ==========================================
+# PUBLISHER NAMES
+# ==========================================
 
-# ---------------- TEXT HELPERS ----------------
+PUBLISHERS = {
+    "openai.com": "OpenAI",
+    "deepmind.google": "Google DeepMind",
+    "huggingface.co": "Hugging Face",
+    "blog.google": "Google",
+    "techcrunch.com": "TechCrunch",
+    "theverge.com": "The Verge",
+    "arstechnica.com": "Ars Technica",
+    "wired.com": "WIRED",
+    "technologyreview.com": "MIT Technology Review",
+    "the-decoder.com": "The Decoder",
+    "engadget.com": "Engadget",
+}
+
+
+def get_publisher(url):
+    host = urlparse(url).netloc.lower()
+    host = host.removeprefix("www.")
+
+    for domain, name in PUBLISHERS.items():
+        if host == domain or host.endswith("." + domain):
+            return name
+
+    return host
+
+
+# ==========================================
+# TEXT HELPERS
+# ==========================================
 
 def clean_text(value):
     if not value:
@@ -47,6 +102,7 @@ def clean_text(value):
 
     soup = BeautifulSoup(str(value), "html.parser")
     text = soup.get_text(" ", strip=True)
+
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -59,19 +115,22 @@ def valid_article_url(url):
     except Exception:
         return False
 
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    if parsed.scheme not in ("http", "https"):
+        return False
+
+    if not parsed.netloc:
         return False
 
     host = parsed.netloc.lower()
 
-    blocked_hosts = (
+    blocked = (
         "abs.twimg.com",
         "pbs.twimg.com",
         "twemoji.maxcdn.com",
         "telegram.org",
     )
 
-    if any(host.endswith(domain) for domain in blocked_hosts):
+    if any(host.endswith(domain) for domain in blocked):
         return False
 
     if parsed.path.lower().endswith((
@@ -92,7 +151,10 @@ def valid_image_url(url):
     except Exception:
         return False
 
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    if parsed.scheme not in ("http", "https"):
+        return False
+
+    if not parsed.netloc:
         return False
 
     if parsed.path.lower().endswith(".svg"):
@@ -101,80 +163,66 @@ def valid_image_url(url):
     return True
 
 
-# ---------------- X CHARACTER COUNT ----------------
+# ==========================================
+# X CHARACTER COUNTER
+# ==========================================
 
 def x_weighted_length(text):
-    """
-    Approximate X's post length:
-    - URLs count as 23 characters.
-    - Non-ASCII characters are conservatively counted as 2.
-    """
-
+    # X counts recognized URLs as 23 characters.
     url_pattern = r"https?://[^\s]+"
     urls = re.findall(url_pattern, text)
 
-    text_without_urls = re.sub(url_pattern, "", text)
+    text_without_urls = re.sub(
+        url_pattern, "", text
+    )
 
     length = len(urls) * 23
 
     for char in text_without_urls:
-        if ord(char) > 127:
-            length += 2
-        else:
-            length += 1
+        length += 1 if ord(char) <= 127 else 2
 
     return length
 
 
-def make_post_text(story):
-    """
-    Create a short post suitable for copying into X.
-    Keep the original article URL intact.
-    """
-
-    title = clean_text(story.get("title", "NEXTBYTE News"))
+def make_x_post(story):
+    title = clean_text(story["title"])
     description = clean_text(story.get("description", ""))
+    publisher = story["publisher"]
     link = story["link"]
 
-    title = title[:160]
-    description = description[:120]
-
-    hashtags = "#AI #Tech"
+    title = title[:150]
+    description = description[:100]
 
     def build():
         return (
             f"⚡ NEXTBYTE\n\n"
             f"{title}\n\n"
             f"{description}\n\n"
+            f"Source: {publisher}\n"
             f"READ FULL STORY ↗\n"
             f"{link}\n\n"
-            f"{hashtags}"
+            f"#AI #Tech"
         )
 
     # Shorten the description first.
-    while x_weighted_length(build()) > X_CHARACTER_LIMIT and description:
+    while x_weighted_length(build()) > X_LIMIT and description:
         description = description[:-5].rstrip()
 
-    # Then shorten the title if necessary.
-    while x_weighted_length(build()) > X_CHARACTER_LIMIT and title:
+    # Then shorten the title.
+    while x_weighted_length(build()) > X_LIMIT and title:
         title = title[:-5].rstrip()
 
-    # Last-resort compact format if the original URL is unusually long.
-    if x_weighted_length(build()) > X_CHARACTER_LIMIT:
-        title = title[:70]
+    # Compact fallback for unusually long URLs.
+    if x_weighted_length(build()) > X_LIMIT:
         description = ""
+        title = title[:60]
 
-    post = build()
-
-    logging.info(
-        "X post length estimate: %s",
-        x_weighted_length(post)
-    )
-
-    return post
+    return build()
 
 
-# ---------------- SEEN STORIES ----------------
+# ==========================================
+# SEEN STORIES
+# ==========================================
 
 def load_seen():
     if not os.path.exists(SEEN_FILE):
@@ -183,8 +231,8 @@ def load_seen():
     try:
         with open(SEEN_FILE, "r", encoding="utf-8") as file:
             return set(json.load(file))
-    except Exception:
-        logging.warning("Could not read seen.json.")
+    except Exception as error:
+        logging.warning("Could not load seen.json: %s", error)
         return set()
 
 
@@ -193,14 +241,15 @@ def save_seen(seen):
         json.dump(sorted(seen), file, indent=2)
 
 
-def story_id(link, title):
-    value = link or title
+def story_id(link):
     return hashlib.sha256(
-        value.encode("utf-8")
+        link.encode("utf-8")
     ).hexdigest()
 
 
-# ---------------- ARTICLE LINKS ----------------
+# ==========================================
+# ARTICLE LINKS
+# ==========================================
 
 def get_article_link(entry):
     candidates = []
@@ -225,7 +274,9 @@ def get_article_link(entry):
     return None
 
 
-# ---------------- IMAGE EXTRACTION ----------------
+# ==========================================
+# ARTICLE IMAGES
+# ==========================================
 
 def image_from_html(value):
     if not value:
@@ -234,8 +285,8 @@ def image_from_html(value):
     soup = BeautifulSoup(str(value), "html.parser")
 
     for img in soup.find_all("img"):
-        for attribute in ("src", "data-src", "data-original"):
-            url = img.get(attribute)
+        for attr in ("src", "data-src", "data-original"):
+            url = img.get(attr)
 
             if valid_image_url(url):
                 return html.unescape(url)
@@ -291,8 +342,7 @@ def get_article_image(article_url):
 
     except Exception as error:
         logging.warning(
-            "Could not extract article image: %s",
-            error
+            "Article image extraction failed: %s", error
         )
 
     return None
@@ -306,8 +356,7 @@ def download_image(image_url):
         response = requests.get(
             image_url,
             headers=HEADERS,
-            timeout=REQUEST_TIMEOUT,
-            stream=True
+            timeout=REQUEST_TIMEOUT
         )
         response.raise_for_status()
 
@@ -325,73 +374,71 @@ def download_image(image_url):
 
         if content.startswith(b"\xff\xd8\xff"):
             extension = ".jpg"
+            mime = "image/jpeg"
         elif content.startswith(b"\x89PNG\r\n\x1a\n"):
             extension = ".png"
+            mime = "image/png"
         else:
-            logging.info("Unsupported image format.")
             return None
 
-        return content, extension
+        return content, extension, mime
 
     except Exception as error:
         logging.warning("Image download failed: %s", error)
         return None
 
 
-# ---------------- TELEGRAM FORMATTING ----------------
+# ==========================================
+# TELEGRAM MESSAGE
+# ==========================================
 
-def make_caption(story):
-    post = make_post_text(story)
+def make_telegram_post(story):
+    title = clean_text(story["title"])
+    description = clean_text(story.get("description", ""))
 
-    title = html.escape(clean_text(story.get("title", "")))
-    link = html.escape(story["link"], quote=True)
+    # Keep the message short and readable.
+    title = title[:180]
+    description = description[:160]
 
-    # Keep the same short post text for X.
-    # Make the READ FULL STORY label clickable in Telegram.
-    escaped_post = html.escape(post)
+    publisher = story["publisher"]
+    link = story["link"]
 
-    linked_post = escaped_post.replace(
-        "READ FULL STORY ↗",
-        f'<a href="{link}">READ FULL STORY ↗</a>',
-        1
+    safe_title = html.escape(title)
+    safe_description = html.escape(description)
+    safe_publisher = html.escape(publisher)
+    safe_link = html.escape(link, quote=True)
+
+    return (
+        f"⚡ <b>NEXTBYTE</b>\n\n"
+        f"<b>{safe_title}</b>\n\n"
+        f"{safe_description}\n\n"
+        f"📰 Source: <b>{safe_publisher}</b>\n\n"
+        f'🔗 <a href="{safe_link}">READ FULL STORY ↗</a>\n'
+        f"{safe_link}\n\n"
+        f"#AI #Tech"
     )
 
-    return linked_post
-
-
-def make_text_message(story):
-    return make_caption(story)
-
-
-# ---------------- TELEGRAM PUBLISHING ----------------
 
 def telegram_send_photo(image_data, caption):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
 
-    content, extension = image_data
-
-    mime_type = (
-        "image/jpeg" if extension == ".jpg"
-        else "image/png"
-    )
+    content, extension, mime = image_data
 
     files = {
         "photo": (
             f"nextbyte{extension}",
             content,
-            mime_type
+            mime
         )
-    }
-
-    data = {
-        "chat_id": CHAT_ID,
-        "caption": caption,
-        "parse_mode": "HTML",
     }
 
     response = requests.post(
         url,
-        data=data,
+        data={
+            "chat_id": CHAT_ID,
+            "caption": caption,
+            "parse_mode": "HTML",
+        },
         files=files,
         timeout=REQUEST_TIMEOUT
     )
@@ -400,9 +447,7 @@ def telegram_send_photo(image_data, caption):
     result = response.json()
 
     if not result.get("ok"):
-        raise RuntimeError(result.get("description", "Telegram photo error"))
-
-    return True
+        raise RuntimeError(result.get("description", "Photo sending failed"))
 
 
 def telegram_send_message(message):
@@ -423,15 +468,31 @@ def telegram_send_message(message):
     result = response.json()
 
     if not result.get("ok"):
-        raise RuntimeError(result.get("description", "Telegram message error"))
-
-    return True
+        raise RuntimeError(result.get("description", "Message sending failed"))
 
 
-# ---------------- RSS PROCESSING ----------------
+# ==========================================
+# FETCH ALL NEWS
+# ==========================================
+
+def get_published_time(entry):
+    parsed = (
+        entry.get("published_parsed")
+        or entry.get("updated_parsed")
+    )
+
+    if parsed:
+        try:
+            return time.mktime(parsed)
+        except Exception:
+            pass
+
+    return 0
+
 
 def fetch_stories():
     stories = []
+    failed_feeds = []
 
     for feed_url in FEEDS:
         logging.info("Checking feed: %s", feed_url)
@@ -446,6 +507,10 @@ def fetch_stories():
 
             feed = feedparser.parse(response.content)
 
+            if not feed.entries:
+                logging.warning("Feed returned no entries: %s", feed_url)
+                continue
+
             for entry in feed.entries:
                 title = clean_text(entry.get("title", ""))
 
@@ -455,10 +520,6 @@ def fetch_stories():
                 link = get_article_link(entry)
 
                 if not link:
-                    logging.warning(
-                        "Skipping story without a valid article URL: %s",
-                        title
-                    )
                     continue
 
                 description = clean_text(
@@ -474,102 +535,170 @@ def fetch_stories():
                     "title": title,
                     "description": description,
                     "link": link,
+                    "publisher": get_publisher(link),
                     "image": get_feed_image(entry),
+                    "published_timestamp": get_published_time(entry),
                 })
 
+            logging.info(
+                "Feed successful: %s (%s articles)",
+                feed_url,
+                len(feed.entries)
+            )
+
         except Exception as error:
+            failed_feeds.append(feed_url)
             logging.error(
                 "Feed failed: %s | %s",
                 feed_url,
                 error
             )
 
+    logging.info(
+        "Feed results: %s successful, %s failed",
+        len(FEEDS) - len(failed_feeds),
+        len(failed_feeds)
+    )
+
     return stories
 
 
-# ---------------- MAIN ----------------
+# ==========================================
+# DIVERSIFY PUBLISHERS
+# ==========================================
 
-def main():
-    logging.info("NEXTBYTE bot started.")
+def select_diverse_stories(stories, seen):
+    """
+    Sort newest stories first, then rotate publishers
+    so one publisher does not dominate a batch.
+    """
 
-    seen = load_seen()
-    stories = fetch_stories()
-
-    logging.info(
-        "Found %s stories in RSS feeds.",
-        len(stories)
-    )
-
-    published = 0
-
+    unique = {}
     for story in stories:
-        if published >= MAX_STORIES:
-            break
-
-        identifier = story_id(
-            story["link"],
-            story["title"]
-        )
+        identifier = story_id(story["link"])
 
         if identifier in seen:
             continue
 
-        logging.info(
-            "Preparing story: %s",
-            story["title"]
-        )
+        unique[identifier] = story
 
-        image_url = story.get("image")
+    grouped = defaultdict(deque)
 
-        if not image_url:
-            image_url = get_article_image(story["link"])
+    ordered = sorted(
+        unique.values(),
+        key=lambda story: story["published_timestamp"],
+        reverse=True
+    )
 
-        sent = False
+    for story in ordered:
+        grouped[story["publisher"]].append(story)
 
-        if image_url:
-            image_data = download_image(image_url)
+    selected = []
 
-            if image_data:
-                try:
-                    telegram_send_photo(
-                        image_data,
-                        make_caption(story)
-                    )
+    while grouped and len(selected) < MAX_STORIES:
+        for publisher in list(grouped.keys()):
+            if grouped[publisher]:
+                selected.append(grouped[publisher].popleft())
 
-                    sent = True
-                    logging.info("Published with image.")
+            if not grouped[publisher]:
+                del grouped[publisher]
 
-                except Exception as error:
-                    logging.warning(
-                        "Photo post failed: %s",
-                        error
-                    )
+            if len(selected) >= MAX_STORIES:
+                break
 
-        if not sent:
+    return selected
+
+
+# ==========================================
+# PUBLISH STORIES
+# ==========================================
+
+def publish_story(story):
+    caption = make_telegram_post(story)
+    image_url = story.get("image")
+
+    if not image_url:
+        image_url = get_article_image(story["link"])
+
+    if image_url:
+        image_data = download_image(image_url)
+
+        if image_data:
             try:
-                telegram_send_message(
-                    make_text_message(story)
+                telegram_send_photo(image_data, caption)
+                logging.info(
+                    "Published with image: %s",
+                    story["title"]
                 )
-
-                sent = True
-                logging.info("Published as text.")
+                return True
 
             except Exception as error:
-                logging.error(
-                    "Text post failed: %s",
+                logging.warning(
+                    "Photo publishing failed: %s",
                     error
                 )
 
-        if sent:
-            seen.add(identifier)
-            published += 1
-            save_seen(seen)
-            time.sleep(2)
+    try:
+        telegram_send_message(caption)
+
+        logging.info(
+            "Published as text: %s",
+            story["title"]
+        )
+        return True
+
+    except Exception as error:
+        logging.error(
+            "Telegram publishing failed: %s",
+            error
+        )
+        return False
+
+
+# ==========================================
+# MAIN
+# ==========================================
+
+def main():
+    logging.info("================================")
+    logging.info("NEXTBYTE NEWS BOT STARTED")
+    logging.info("================================")
+
+    seen = load_seen()
+
+    stories = fetch_stories()
 
     logging.info(
-        "Finished. Published %s new stories.",
-        published
+        "Total articles collected: %s",
+        len(stories)
     )
+
+    selected = select_diverse_stories(stories, seen)
+
+    logging.info(
+        "New stories selected: %s",
+        len(selected)
+    )
+
+    published = 0
+
+    for story in selected:
+        logging.info(
+            "Publishing from %s: %s",
+            story["publisher"],
+            story["title"]
+        )
+
+        if publish_story(story):
+            seen.add(story_id(story["link"]))
+            save_seen(seen)
+            published += 1
+            time.sleep(2)
+
+    logging.info("================================")
+    logging.info("PUBLISHED: %s", published)
+    logging.info("NEXTBYTE BOT FINISHED")
+    logging.info("================================")
 
 
 if __name__ == "__main__":
